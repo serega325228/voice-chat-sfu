@@ -209,8 +209,6 @@ func (s *SFUService) ProcessingOffer(
 func (s *SFUService) bindPeerConnectionHandlers(ctx context.Context, peer *models.Peer) error {
 	const op = "SFUService.bindPeerConnectionHandlers"
 
-	var bindErr error
-
 	peer.HandlersOnce.Do(func() {
 		peer.Conn.OnICECandidate(func(c *webrtc.ICECandidate) {
 			if c == nil {
@@ -241,10 +239,6 @@ func (s *SFUService) bindPeerConnectionHandlers(ctx context.Context, peer *model
 			}
 		})
 	})
-
-	if bindErr != nil {
-		return fmt.Errorf("%s: %w", op, bindErr)
-	}
 
 	return nil
 }

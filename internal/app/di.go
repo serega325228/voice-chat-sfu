@@ -5,7 +5,6 @@ import (
 	"sync"
 	grpcapp "voice-chat-sfu/internal/app/grpc"
 	"voice-chat-sfu/internal/config"
-	"voice-chat-sfu/internal/grpc/session"
 	"voice-chat-sfu/internal/services"
 	"voice-chat-sfu/internal/storage"
 )
