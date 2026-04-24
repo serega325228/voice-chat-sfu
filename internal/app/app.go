@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os/signal"
 	"syscall"
@@ -14,66 +16,65 @@ type App struct {
 	container  *diContainer
 	gRPCServer *grpcapp.App
 	cfg        *config.Config
+	log        *slog.Logger
 }
 
-func New() *App {
-	cfg := config.MustLoad()
+func New() (*App, error) {
+	const op = "App.New"
 
+	cfg := config.MustLoad()
 	log := logger.SetupLogger(cfg.Env)
 
-	a := &App{
-		container: newDIContainer(cfg, log),
-		cfg:       cfg,
+	container := newDIContainer(cfg, log)
+	gRPCServer, err := container.GRPCApp()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
-	a.initDeps()
-
-	return a
-}
-
-func (a *App) initDeps() {
-	ctx := context.Background()
-
-	a.container.Storage(ctx)
-	a.container.Router(ctx)
-
-	a.gRPCServer = grpcapp.New(
-		a.container.log,
-		a.cfg.Port,
-	)
+	return &App{
+		container:  container,
+		gRPCServer: gRPCServer,
+		cfg:        cfg,
+		log:        log,
+	}, nil
 }
 
 func (a *App) Run() error {
+	const op = "App.Run"
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	slog.Info("сервер запущен", "port", a.cfg.GRPCServer.Port)
+	errCh := make(chan error, 1)
+
+	a.log.Info("starting gRPC server", "port", a.cfg.GRPCServer.Port)
 
 	go func() {
-		a.gRPCServer.MustRun()
+		errCh <- a.gRPCServer.Run()
 	}()
 
-	//TODO Graceful shutdown
-	<-ctx.Done()
-	slog.Info("получен сигнал, завершаем...")
-
-	stop()
-
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), a.cfg.HTTPServer.ShutdownTimeout)
-	defer shutdownCancel()
-
-	if err := a.gRPCServer.Close(shutdownCtx); err != nil {
-		slog.Error("ошибка при остановке сервера", "err", err)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return fmt.Errorf("%s: %w", op, err)
+		}
+		return nil
+	case <-ctx.Done():
+		a.log.Info("shutdown signal received")
 	}
 
-	slog.Info("сервер остановлен")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), a.cfg.ServerShutdownTimeout())
+	defer cancel()
 
-	closerCtx, closerCancel := context.WithTimeout(context.Background(), a.cfg.HTTPServer.CloseTimeout)
-	defer closerCancel()
-
-	if err := closer.CloseAll(closerCtx); err != nil {
-		slog.Error("ошибки при закрытии ресурсов", "err", err)
+	if err := a.gRPCServer.Close(shutdownCtx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s: %w", op, err)
 	}
+
+	if err := <-errCh; err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	a.log.Info("server stopped")
 
 	return nil
 }

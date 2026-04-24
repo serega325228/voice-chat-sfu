@@ -1,6 +1,8 @@
 package grpcapp
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -18,10 +20,10 @@ type App struct {
 func New(
 	log *slog.Logger,
 	port int,
+	sessionService session.SessionService,
 ) *App {
 	gRPCServer := grpc.NewServer()
-
-	session.Register(gRPCServer)
+	session.Register(gRPCServer, sessionService)
 
 	return &App{
 		log:        log,
@@ -30,25 +32,40 @@ func New(
 	}
 }
 
-func (a *App) MustRun() {
-	if err := a.Run(); err != nil {
-		panic(err)
-	}
-}
-
 func (a *App) Run() error {
-	l, err := net.Listen("tcp", fmt.Sprintf(":%d", a.port))
+	const op = "grpcapp.App.Run"
+
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", a.port))
 	if err != nil {
-		return fmt.Errorf("") //TODO
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	if err := a.gRPCServer.Serve(l); err != nil {
-		return fmt.Errorf("") //TODO
+	a.log.Info("gRPC server listening", "port", a.port)
+
+	if err := a.gRPCServer.Serve(listener); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	return nil
 }
 
-func (a *App) Stop() {
-	a.gRPCServer.GracefulStop()
+func (a *App) Close(ctx context.Context) error {
+	const op = "grpcapp.App.Close"
+
+	done := make(chan struct{})
+
+	go func() {
+		a.gRPCServer.GracefulStop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		a.log.Warn("graceful shutdown timed out, forcing stop")
+		a.gRPCServer.Stop()
+		<-done
+		return fmt.Errorf("%s: %w", op, ctx.Err())
+	}
 }

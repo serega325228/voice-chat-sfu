@@ -3,41 +3,36 @@ package config
 import (
 	"log"
 	"os"
+	"time"
 
 	"github.com/ilyakaznacheev/cleanenv"
 )
 
 type Config struct {
-	Env        string `yaml:"env" env:"ENV" env-default:"development"`
-	GRPCServer `yaml:"grpc_server"`
+	Env        string         `yaml:"env" env:"ENV" env-default:"development"`
+	GRPCServer GRPCServer     `yaml:"grpc_server"`
+	HTTPServer legacyTimeouts `yaml:"http_server"`
 }
 
 type GRPCServer struct {
-	Port int `yaml:"port" env-default:"8085"`
-	// Address         string        `yaml:"address" env-default:"localhost:8080"`
-	// ShutdownTimeout time.Duration `yaml:"shutdown_timeout" env-default:"15s"`
-	// CloseTimeout    time.Duration `yaml:"close_timeout" env-default:"10s"`
-	// Timeout         time.Duration `yaml:"timeout" env-default:"4s"`
-	// IdleTimeout     time.Duration `yaml:"idle_timeout" env-default:"60s"`
+	Port            int           `yaml:"port" env-default:"8085"`
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout" env-default:"15s"`
 }
 
-// type Secrets struct {
-// 	JWTSecret   string `env:"JWT_SECRET_KEY" env-required:"true"`
-// 	PostgresURL string `env:"POSTGRES_URL" env-required:"true"`
-// }
+type legacyTimeouts struct {
+	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
+}
 
-// func MustLoadSecrets() *Secrets {
-// 	if err := godotenv.Load(); err != nil {
-// 		log.Fatal(".env file is not opened")
-// 	}
+func (c *Config) ServerShutdownTimeout() time.Duration {
+	if c.GRPCServer.ShutdownTimeout > 0 {
+		return c.GRPCServer.ShutdownTimeout
+	}
+	if c.HTTPServer.ShutdownTimeout > 0 {
+		return c.HTTPServer.ShutdownTimeout
+	}
 
-// 	var secrets Secrets
-
-// 	secrets.JWTSecret = os.Getenv("JWT_SECRET_KEY")
-// 	secrets.PostgresURL = os.Getenv("POSTGRES_URL")
-
-// 	return &secrets
-// }
+	return 15 * time.Second
+}
 
 func MustLoad() *Config {
 	configPath := os.Getenv("CONFIG_PATH")

@@ -13,12 +13,15 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-// TODO make same peer storage with rwmutex
 type SFUStorage interface {
-	Add(roomID uuid.UUID, creatorPeer *models.Peer) error
-	Get(roomID uuid.UUID) (*models.Room, error)
-	Delete(roomID uuid.UUID) error
-	RoomExceptAuthor(roomID, peerID uuid.UUID) []*models.Peer
+	CreateRoom(roomID uuid.UUID, creatorPeer *models.Peer) error
+	AddPeer(roomID uuid.UUID, peer *models.Peer) error
+	GetPeer(roomID, peerID uuid.UUID) (*models.Peer, error)
+	RemovePeer(roomID, peerID uuid.UUID) (*models.Peer, error)
+	PeersExcept(roomID, peerID uuid.UUID) ([]*models.Peer, error)
+	AddTrack(roomID uuid.UUID, track *models.PublishedTrack) error
+	RemoveTrack(roomID uuid.UUID, trackID string) error
+	Tracks(roomID uuid.UUID) ([]*models.PublishedTrack, error)
 }
 
 type SFUService struct {
@@ -31,15 +34,16 @@ func NewSFUService(
 	log *slog.Logger,
 	storage SFUStorage,
 ) (*SFUService, error) {
+	const op = "SFUService.NewSFUService"
 
 	mediaEngine := &webrtc.MediaEngine{}
 	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
 	interceptorRegistry := &interceptor.Registry{}
 	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, interceptorRegistry); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
 	api := webrtc.NewAPI(
@@ -54,7 +58,9 @@ func NewSFUService(
 	}, nil
 }
 
-func (s *SFUService) initConn(ctx context.Context) *webrtc.PeerConnection {
+func (s *SFUService) initConn() (*webrtc.PeerConnection, error) {
+	const op = "SFUService.initConn"
+
 	peerConnectionConfig := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
@@ -65,76 +71,100 @@ func (s *SFUService) initConn(ctx context.Context) *webrtc.PeerConnection {
 
 	peerConnection, err := s.api.NewPeerConnection(peerConnectionConfig)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
-
-	//TODO maybe(mostly must) replace defer with goroutine
-	// defer func() {
-	// 	if cErr := peerConnection.Close(); cErr != nil {
-	// 		fmt.Printf("cannot close peerConnection: %v\n", cErr)
-	// 	}
-	// }()
 
 	if _, err = peerConnection.AddTransceiverFromKind(webrtc.RTPCodecTypeAudio); err != nil {
-		panic(err)
+		_ = peerConnection.Close()
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
-	return peerConnection
+	return peerConnection, nil
 }
 
 func (s *SFUService) CreateSession(ctx context.Context, roomID, peerID uuid.UUID) error {
-	peer := &models.Peer{
-		ID:     peerID,
-		RoomID: roomID,
-		Conn:   s.initConn(ctx),
-		Events: make(chan *models.PeerEvent),
+	const op = "SFUService.CreateSession"
+
+	peer, err := s.newPeer(roomID, peerID)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	if err := s.storage.Add(roomID, peer); err != nil {
-		return fmt.Errorf("") //TODO
+	if err := s.bindPeerConnectionHandlers(ctx, peer); err != nil {
+		_ = peer.Conn.Close()
+		return fmt.Errorf("%s: %w", op, err)
 	}
+
+	if err := s.storage.CreateRoom(roomID, peer); err != nil {
+		_ = peer.Conn.Close()
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
 	return nil
 }
 
 func (s *SFUService) JoinSession(ctx context.Context, roomID, peerID uuid.UUID) error {
-	room, err := s.storage.Get(roomID)
+	const op = "SFUService.JoinSession"
+
+	peer, err := s.newPeer(roomID, peerID)
 	if err != nil {
-		return fmt.Errorf("") //TODO
-	}
-	if _, ok := room.Peers[peerID]; ok {
-		return fmt.Errorf("") //TODO
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	newPeer := &models.Peer{
-		ID:     peerID,
-		RoomID: roomID,
-		Conn:   s.initConn(ctx),
-		Events: make(chan *models.PeerEvent),
+	if err := s.bindPeerConnectionHandlers(ctx, peer); err != nil {
+		_ = peer.Conn.Close()
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	room.Peers[peerID] = newPeer
+	if err := s.storage.AddPeer(roomID, peer); err != nil {
+		_ = peer.Conn.Close()
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	publishedTracks, err := s.storage.Tracks(roomID)
+	if err != nil {
+		_ = s.closeAndRemovePeer(peer)
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	for _, publishedTrack := range publishedTracks {
+		if publishedTrack.PublisherID == peer.ID {
+			continue
+		}
+		if err := s.sendLocalTrack(peer, publishedTrack.Track); err != nil {
+			s.log.Warn("attach existing track to joined peer", "room_id", roomID, "peer_id", peerID, "track_id", publishedTrack.ID, "err", err)
+		}
+	}
 
 	return nil
 }
 
 func (s *SFUService) LeaveSession(ctx context.Context, roomID, peerID uuid.UUID) error {
-	room, err := s.storage.Get(roomID)
+	const op = "SFUService.LeaveSession"
+
+	_ = ctx
+
+	peer, err := s.storage.RemovePeer(roomID, peerID)
 	if err != nil {
-		return fmt.Errorf("") //TODO
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	peer, ok := room.Peers[peerID]
-	if ok {
-		return fmt.Errorf("") //TODO
+	if err := peer.Conn.Close(); err != nil {
+		s.log.Warn("close peer connection", "room_id", roomID, "peer_id", peerID, "err", err)
 	}
-
-	if err = peer.Conn.Close(); err != nil {
-		return err
-	}
-
-	delete(room.Peers, peerID)
 
 	return nil
+}
+
+func (s *SFUService) GetPeer(roomID, peerID uuid.UUID) (*models.Peer, error) {
+	const op = "SFUService.GetPeer"
+
+	peer, err := s.storage.GetPeer(roomID, peerID)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	return peer, nil
 }
 
 func (s *SFUService) ProcessingOffer(
@@ -142,7 +172,11 @@ func (s *SFUService) ProcessingOffer(
 	peer *models.Peer,
 	sdp string,
 ) error {
-	err := s.bindPeerConnectionHandlers(ctx, peer)
+	const op = "SFUService.ProcessingOffer"
+
+	if err := s.bindPeerConnectionHandlers(ctx, peer); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
 
 	webrtcOffer := webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
@@ -150,49 +184,69 @@ func (s *SFUService) ProcessingOffer(
 	}
 
 	if err := peer.Conn.SetRemoteDescription(webrtcOffer); err != nil {
-		return fmt.Errorf("set remote description: %w", err)
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	answer, err := peer.Conn.CreateAnswer(nil)
 	if err != nil {
-		return fmt.Errorf("create answer: %w", err)
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	if err := peer.Conn.SetLocalDescription(answer); err != nil {
-		return fmt.Errorf("set local description: %w", err)
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	peer.Events <- &models.PeerEvent{
+	if err := s.emitPeerEvent(ctx, peer, &models.PeerEvent{
 		Type:   models.SendLocalAnswer,
 		Answer: peer.Conn.LocalDescription(),
+	}); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	return nil
 }
 
 func (s *SFUService) bindPeerConnectionHandlers(ctx context.Context, peer *models.Peer) error {
-	peer.Conn.OnICECandidate(func(c *webrtc.ICECandidate) {
-		if c == nil {
-			return
-		}
+	const op = "SFUService.bindPeerConnectionHandlers"
 
-		peer.Events <- &models.PeerEvent{
-			Type:      models.SendLocalCandidate,
-			Candidate: c,
-		}
+	var bindErr error
+
+	peer.HandlersOnce.Do(func() {
+		peer.Conn.OnICECandidate(func(c *webrtc.ICECandidate) {
+			if c == nil {
+				return
+			}
+
+			if err := s.emitPeerEvent(ctx, peer, &models.PeerEvent{
+				Type:      models.SendLocalCandidate,
+				Candidate: c,
+			}); err != nil {
+				s.log.Warn("emit local ICE candidate", "peer_id", peer.ID, "room_id", peer.RoomID, "err", err)
+			}
+		})
+
+		peer.Conn.OnTrack(func(remoteTrack *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+			go func() {
+				if err := s.handleRemoteTrack(ctx, peer, remoteTrack); err != nil && !errors.Is(err, context.Canceled) {
+					s.log.Warn("handle remote track", "peer_id", peer.ID, "room_id", peer.RoomID, "track_id", remoteTrack.ID(), "err", err)
+				}
+			}()
+		})
+
+		peer.Conn.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+			if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
+				if err := s.closeAndRemovePeer(peer); err != nil {
+					s.log.Warn("cleanup peer after connection state change", "peer_id", peer.ID, "room_id", peer.RoomID, "state", state.String(), "err", err)
+				}
+			}
+		})
 	})
 
-	errCh := make(chan error, 2)
-
-	peer.Conn.OnTrack(func(remoteTrack *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		go s.handleRemoteTrack(ctx, peer, remoteTrack, errCh)
-	})
-
-	err := <-errCh
-	if errors.Is(err, context.Canceled) {
-		return nil
+	if bindErr != nil {
+		return fmt.Errorf("%s: %w", op, bindErr)
 	}
-	return err
+
+	return nil
 }
 
 func (s *SFUService) GetCandidate(
@@ -203,6 +257,10 @@ func (s *SFUService) GetCandidate(
 	sdpMlineIndex int32,
 	usernameFragment string,
 ) error {
+	const op = "SFUService.GetCandidate"
+
+	_ = ctx
+
 	mid := uint16(sdpMlineIndex)
 	if err := peer.Conn.AddICECandidate(webrtc.ICECandidateInit{
 		Candidate:        candidate,
@@ -210,7 +268,7 @@ func (s *SFUService) GetCandidate(
 		SDPMLineIndex:    &mid,
 		UsernameFragment: &usernameFragment,
 	}); err != nil {
-		return err
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	return nil
@@ -220,36 +278,72 @@ func (s *SFUService) handleRemoteTrack(
 	ctx context.Context,
 	peer *models.Peer,
 	remoteTrack *webrtc.TrackRemote,
-	errCh chan error,
 ) error {
-	localTrack, err := webrtc.NewTrackLocalStaticRTP(remoteTrack.Codec().RTPCodecCapability, remoteTrack.ID(), remoteTrack.StreamID())
+	const op = "SFUService.handleRemoteTrack"
+
+	localTrack, err := webrtc.NewTrackLocalStaticRTP(
+		remoteTrack.Codec().RTPCodecCapability,
+		remoteTrack.ID(),
+		remoteTrack.StreamID(),
+	)
 	if err != nil {
-		errCh <- fmt.Errorf("", err) //TODO
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	publishedTrack := &models.PublishedTrack{
+		ID:          trackKey(peer.ID, remoteTrack.ID(), remoteTrack.StreamID()),
+		PublisherID: peer.ID,
+		Track:       localTrack,
+	}
+
+	if err := s.storage.AddTrack(peer.RoomID, publishedTrack); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	defer func() {
+		if err := s.storage.RemoveTrack(peer.RoomID, publishedTrack.ID); err != nil {
+			s.log.Warn("remove published track", "peer_id", peer.ID, "room_id", peer.RoomID, "track_id", publishedTrack.ID, "err", err)
+		}
+	}()
+
+	receivers, err := s.storage.PeersExcept(peer.RoomID, peer.ID)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	for _, receiver := range receivers {
+		if err := s.sendLocalTrack(receiver, localTrack); err != nil {
+			s.log.Warn("send published track to peer", "from_peer_id", peer.ID, "to_peer_id", receiver.ID, "room_id", peer.RoomID, "track_id", publishedTrack.ID, "err", err)
+		}
 	}
 
 	rtpBuf := make([]byte, 1500)
 	for {
-		i, _, err := remoteTrack.Read(rtpBuf)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		n, _, err := remoteTrack.Read(rtpBuf)
 		if err != nil {
-			errCh <- fmt.Errorf("", err) //TODO
-			continue
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) {
+				return nil
+			}
+			return fmt.Errorf("%s: %w", op, err)
 		}
 
-		if _, err := localTrack.Write(rtpBuf[:i]); err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			errCh <- fmt.Errorf("", err) //TODO
-			continue
-		}
-
-		for _, receiver := range s.storage.RoomExceptAuthor(peer.RoomID, peer.ID) {
-			errCh <- s.sendLocalTrack(ctx, receiver, localTrack)
+		if _, err := localTrack.Write(rtpBuf[:n]); err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			return fmt.Errorf("%s: %w", op, err)
 		}
 	}
 }
 
-func (s *SFUService) sendLocalTrack(ctx context.Context, toPeer *models.Peer, localTrack *webrtc.TrackLocalStaticRTP) error {
+func (s *SFUService) sendLocalTrack(toPeer *models.Peer, localTrack *webrtc.TrackLocalStaticRTP) error {
+	const op = "SFUService.sendLocalTrack"
+
 	rtpSender, err := toPeer.Conn.AddTrack(localTrack)
 	if err != nil {
-		return err
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	go func() {
@@ -262,4 +356,49 @@ func (s *SFUService) sendLocalTrack(ctx context.Context, toPeer *models.Peer, lo
 	}()
 
 	return nil
+}
+
+func (s *SFUService) newPeer(roomID, peerID uuid.UUID) (*models.Peer, error) {
+	const op = "SFUService.newPeer"
+
+	conn, err := s.initConn()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	return &models.Peer{
+		ID:     peerID,
+		RoomID: roomID,
+		Conn:   conn,
+		Events: make(chan *models.PeerEvent, 16),
+	}, nil
+}
+
+func (s *SFUService) emitPeerEvent(ctx context.Context, peer *models.Peer, evt *models.PeerEvent) error {
+	const op = "SFUService.emitPeerEvent"
+
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("%s: %w", op, ctx.Err())
+	case peer.Events <- evt:
+		return nil
+	}
+}
+
+func (s *SFUService) closeAndRemovePeer(peer *models.Peer) error {
+	const op = "SFUService.closeAndRemovePeer"
+
+	if _, err := s.storage.RemovePeer(peer.RoomID, peer.ID); err != nil {
+		s.log.Debug("peer already removed from storage", "room_id", peer.RoomID, "peer_id", peer.ID, "err", err)
+	}
+
+	if err := peer.Conn.Close(); err != nil {
+		s.log.Debug("peer connection already closed", "room_id", peer.RoomID, "peer_id", peer.ID, "err", err)
+	}
+
+	return nil
+}
+
+func trackKey(peerID uuid.UUID, trackID, streamID string) string {
+	return fmt.Sprintf("%s:%s:%s", peerID, trackID, streamID)
 }
