@@ -6,10 +6,10 @@ import (
 	"fmt"
 	"io"
 	"voice-chat-sfu/internal/models"
-	sessionv1 "voice-chat-sfu/protos/gen/go/session"
 
 	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
+	sessionv1 "github.com/serega325228/voice-chat-sfu-protos/gen/go/session"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"

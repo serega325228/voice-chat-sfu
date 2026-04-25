@@ -3,11 +3,11 @@ module voice-chat-sfu
 go 1.26.1
 
 require (
-	github.com/go-chi/chi/v5 v5.2.5
 	github.com/google/uuid v1.6.0
 	github.com/ilyakaznacheev/cleanenv v1.5.0
 	github.com/pion/interceptor v0.1.44
 	github.com/pion/webrtc/v4 v4.2.11
+	github.com/serega325228/voice-chat-sfu-protos v0.0.4-0.20260423071430-33600fb5a3b1
 	google.golang.org/grpc v1.80.0
 	google.golang.org/protobuf v1.36.11
 )
