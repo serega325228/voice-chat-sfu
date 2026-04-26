@@ -204,10 +204,8 @@ func (s *serverAPI) toSignalMessage(peer *models.Peer, peerEvent *models.PeerEve
 			},
 		}
 	case models.RequestRenegotiate:
-		msg.Payload = &sessionv1.SignalMessage_ConnectionStateChanged{
-			ConnectionStateChanged: &sessionv1.PeerConnectionStateChanged{
-				State: peerEvent.State,
-			},
+		msg.Payload = &sessionv1.SignalMessage_RenegotiationNeeded{
+			RenegotiationNeeded: &sessionv1.RenegotiationNeeded{},
 		}
 	}
 
@@ -226,10 +224,6 @@ func (s *serverAPI) handleIncoming(
 		return s.handleRemoteOffer(ctx, peer, x.RemoteOffer)
 	case *sessionv1.SignalMessage_RemoteIceCandidate:
 		return s.handleRemoteIceCandidate(ctx, peer, x.RemoteIceCandidate)
-	case *sessionv1.SignalMessage_PeerClosed:
-		return s.handlePeerClosed(ctx, peer, x.PeerClosed)
-	case *sessionv1.SignalMessage_ConnectionStateChanged:
-		return s.handleConnectionStateChanged(ctx, peer, x.ConnectionStateChanged)
 	default:
 		return fmt.Errorf("%s: %w", op, status.Error(codes.InvalidArgument, "unknown signal message payload"))
 	}
@@ -285,41 +279,6 @@ func (s *serverAPI) handleRemoteIceCandidate(
 		candidate.GetCandidate().GetUsernameFragment(),
 	); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	return nil
-}
-
-func (s *serverAPI) handlePeerClosed(
-	ctx context.Context,
-	peer *models.Peer,
-	_ *sessionv1.PeerClosed,
-) error {
-	const op = "serverAPI.handlePeerClosed"
-
-	if err := s.service.LeaveSession(ctx, peer.RoomID, peer.ID); err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	return nil
-}
-
-func (s *serverAPI) handleConnectionStateChanged(
-	ctx context.Context,
-	peer *models.Peer,
-	state *sessionv1.PeerConnectionStateChanged,
-) error {
-	_ = ctx
-	_ = peer
-
-	if state == nil {
-		return status.Error(codes.InvalidArgument, "serverAPI.handleConnectionStateChanged: empty connection state payload")
-	}
-	if state.GetState() == "" {
-		return status.Error(codes.InvalidArgument, "serverAPI.handleConnectionStateChanged: empty connection state")
-	}
-	if state.GetState() == negotiationNeededState {
-		return status.Error(codes.InvalidArgument, "serverAPI.handleConnectionStateChanged: negotiation_needed is reserved for server events")
 	}
 
 	return nil
