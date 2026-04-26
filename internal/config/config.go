@@ -1,17 +1,18 @@
 package config
 
 import (
-	"log"
+	"errors"
 	"os"
 	"time"
 
 	"github.com/ilyakaznacheev/cleanenv"
 )
 
+var ErrConfigPathNotSet = errors.New("CONFIG_PATH is not set")
+
 type Config struct {
-	Env        string         `yaml:"env" env:"ENV" env-default:"development"`
-	GRPCServer GRPCServer     `yaml:"grpc_server"`
-	HTTPServer legacyTimeouts `yaml:"http_server"`
+	Env        string     `yaml:"env" env:"ENV" env-default:"development"`
+	GRPCServer GRPCServer `yaml:"grpc_server"`
 }
 
 type GRPCServer struct {
@@ -19,36 +20,29 @@ type GRPCServer struct {
 	ShutdownTimeout time.Duration `yaml:"shutdown_timeout" env-default:"15s"`
 }
 
-type legacyTimeouts struct {
-	ShutdownTimeout time.Duration `yaml:"shutdown_timeout"`
-}
-
 func (c *Config) ServerShutdownTimeout() time.Duration {
 	if c.GRPCServer.ShutdownTimeout > 0 {
 		return c.GRPCServer.ShutdownTimeout
-	}
-	if c.HTTPServer.ShutdownTimeout > 0 {
-		return c.HTTPServer.ShutdownTimeout
 	}
 
 	return 15 * time.Second
 }
 
-func MustLoad() *Config {
+func Load() (*Config, error) {
 	configPath := os.Getenv("CONFIG_PATH")
 	if configPath == "" {
-		log.Fatal("CONFIG_PATH is not set")
+		return nil, ErrConfigPathNotSet
 	}
 
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		log.Fatalf("config file doesn't exist: %s", configPath)
+	if _, err := os.Stat(configPath); err != nil {
+		return nil, err
 	}
 
 	var cfg Config
 
 	if err := cleanenv.ReadConfig(configPath, &cfg); err != nil {
-		log.Fatalf("cannot read config: %s", err)
+		return nil, err
 	}
 
-	return &cfg
+	return &cfg, nil
 }

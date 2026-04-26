@@ -15,6 +15,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+const negotiationNeededState = "negotiation_needed"
+
 type SessionService interface {
 	CreateSession(ctx context.Context, roomID, peerID uuid.UUID) error
 	JoinSession(ctx context.Context, roomID, peerID uuid.UUID) error
@@ -116,6 +118,9 @@ func (s *serverAPI) SignalPeer(
 		wrappedErr := fmt.Errorf("%s: %w", op, err)
 		return status.Error(codes.NotFound, wrappedErr.Error())
 	}
+	defer func() {
+		_ = s.service.LeaveSession(context.Background(), peer.RoomID, peer.ID)
+	}()
 
 	errCh := make(chan error, 2)
 
@@ -145,6 +150,9 @@ func (s *serverAPI) SignalPeer(
 			case <-ctx.Done():
 				errCh <- ctx.Err()
 				return
+			case <-peer.LifetimeCtx.Done():
+				errCh <- peer.LifetimeCtx.Err()
+				return
 			case evt := <-peer.Events:
 				if err := stream.Send(s.toSignalMessage(peer, evt)); err != nil {
 					errCh <- err
@@ -169,6 +177,9 @@ func (s *serverAPI) toSignalMessage(peer *models.Peer, peerEvent *models.PeerEve
 
 	switch peerEvent.Type {
 	case models.SendLocalAnswer:
+		if peerEvent.Answer == nil {
+			return msg
+		}
 		msg.Payload = &sessionv1.SignalMessage_LocalAnswer{
 			LocalAnswer: &sessionv1.LocalAnswer{
 				Answer: &sessionv1.SessionDescription{
@@ -178,6 +189,9 @@ func (s *serverAPI) toSignalMessage(peer *models.Peer, peerEvent *models.PeerEve
 			},
 		}
 	case models.SendLocalCandidate:
+		if peerEvent.Candidate == nil {
+			return msg
+		}
 		candidate := peerEvent.Candidate.ToJSON()
 		msg.Payload = &sessionv1.SignalMessage_LocalIceCandidate{
 			LocalIceCandidate: &sessionv1.LocalIceCandidate{
@@ -187,6 +201,12 @@ func (s *serverAPI) toSignalMessage(peer *models.Peer, peerEvent *models.PeerEve
 					SdpMlineIndex:    int32(valueOrZero(candidate.SDPMLineIndex)),
 					UsernameFragment: valueOrEmpty(candidate.UsernameFragment),
 				},
+			},
+		}
+	case models.RequestRenegotiate:
+		msg.Payload = &sessionv1.SignalMessage_ConnectionStateChanged{
+			ConnectionStateChanged: &sessionv1.PeerConnectionStateChanged{
+				State: peerEvent.State,
 			},
 		}
 	}
@@ -222,6 +242,16 @@ func (s *serverAPI) handleRemoteOffer(
 ) error {
 	const op = "serverAPI.handleRemoteOffer"
 
+	if offer == nil || offer.GetOffer() == nil {
+		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty remote offer", op))
+	}
+	if offer.GetOffer().GetType() != sessionv1.SdpType_SDP_TYPE_OFFER {
+		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: unsupported SDP type %s", op, offer.GetOffer().GetType().String()))
+	}
+	if offer.GetOffer().GetSdp() == "" {
+		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty SDP in remote offer", op))
+	}
+
 	if err := s.service.ProcessingOffer(ctx, peer, offer.GetOffer().GetSdp()); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -235,6 +265,16 @@ func (s *serverAPI) handleRemoteIceCandidate(
 	candidate *sessionv1.RemoteIceCandidate,
 ) error {
 	const op = "serverAPI.handleRemoteIceCandidate"
+
+	if candidate == nil || candidate.GetCandidate() == nil {
+		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty ICE candidate payload", op))
+	}
+	if candidate.GetCandidate().GetCandidate() == "" {
+		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty ICE candidate", op))
+	}
+	if candidate.GetCandidate().GetSdpMlineIndex() < 0 {
+		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: negative SDP m-line index", op))
+	}
 
 	if err := s.service.GetCandidate(
 		ctx,
@@ -267,10 +307,20 @@ func (s *serverAPI) handlePeerClosed(
 func (s *serverAPI) handleConnectionStateChanged(
 	ctx context.Context,
 	peer *models.Peer,
-	_ *sessionv1.PeerConnectionStateChanged,
+	state *sessionv1.PeerConnectionStateChanged,
 ) error {
 	_ = ctx
 	_ = peer
+
+	if state == nil {
+		return status.Error(codes.InvalidArgument, "serverAPI.handleConnectionStateChanged: empty connection state payload")
+	}
+	if state.GetState() == "" {
+		return status.Error(codes.InvalidArgument, "serverAPI.handleConnectionStateChanged: empty connection state")
+	}
+	if state.GetState() == negotiationNeededState {
+		return status.Error(codes.InvalidArgument, "serverAPI.handleConnectionStateChanged: negotiation_needed is reserved for server events")
+	}
 
 	return nil
 }

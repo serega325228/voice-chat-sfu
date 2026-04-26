@@ -13,11 +13,13 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+const renegotiationNeededState = "negotiation_needed"
+
 type SFUStorage interface {
 	CreateRoom(roomID uuid.UUID, creatorPeer *models.Peer) error
 	AddPeer(roomID uuid.UUID, peer *models.Peer) error
 	GetPeer(roomID, peerID uuid.UUID) (*models.Peer, error)
-	RemovePeer(roomID, peerID uuid.UUID) (*models.Peer, error)
+	RemovePeer(roomID, peerID uuid.UUID) (*models.Peer, []*models.PublishedTrack, error)
 	PeersExcept(roomID, peerID uuid.UUID) ([]*models.Peer, error)
 	AddTrack(roomID uuid.UUID, track *models.PublishedTrack) error
 	RemoveTrack(roomID uuid.UUID, trackID string) error
@@ -85,12 +87,14 @@ func (s *SFUService) initConn() (*webrtc.PeerConnection, error) {
 func (s *SFUService) CreateSession(ctx context.Context, roomID, peerID uuid.UUID) error {
 	const op = "SFUService.CreateSession"
 
+	_ = ctx
+
 	peer, err := s.newPeer(roomID, peerID)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	if err := s.bindPeerConnectionHandlers(ctx, peer); err != nil {
+	if err := s.bindPeerConnectionHandlers(peer); err != nil {
 		_ = peer.Conn.Close()
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -106,12 +110,14 @@ func (s *SFUService) CreateSession(ctx context.Context, roomID, peerID uuid.UUID
 func (s *SFUService) JoinSession(ctx context.Context, roomID, peerID uuid.UUID) error {
 	const op = "SFUService.JoinSession"
 
+	_ = ctx
+
 	peer, err := s.newPeer(roomID, peerID)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	if err := s.bindPeerConnectionHandlers(ctx, peer); err != nil {
+	if err := s.bindPeerConnectionHandlers(peer); err != nil {
 		_ = peer.Conn.Close()
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -127,12 +133,25 @@ func (s *SFUService) JoinSession(ctx context.Context, roomID, peerID uuid.UUID) 
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
+	addedTrack := false
 	for _, publishedTrack := range publishedTracks {
 		if publishedTrack.PublisherID == peer.ID {
 			continue
 		}
-		if err := s.sendLocalTrack(peer, publishedTrack.Track); err != nil {
+
+		sent, err := s.sendLocalTrack(peer, publishedTrack)
+		if err != nil {
 			s.log.Warn("attach existing track to joined peer", "room_id", roomID, "peer_id", peerID, "track_id", publishedTrack.ID, "err", err)
+			continue
+		}
+		if sent {
+			addedTrack = true
+		}
+	}
+
+	if addedTrack {
+		if err := s.requestRenegotiation(peer); err != nil {
+			return fmt.Errorf("%s: %w", op, err)
 		}
 	}
 
@@ -144,13 +163,13 @@ func (s *SFUService) LeaveSession(ctx context.Context, roomID, peerID uuid.UUID)
 
 	_ = ctx
 
-	peer, err := s.storage.RemovePeer(roomID, peerID)
+	peer, err := s.storage.GetPeer(roomID, peerID)
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	if err := peer.Conn.Close(); err != nil {
-		s.log.Warn("close peer connection", "room_id", roomID, "peer_id", peerID, "err", err)
+	if err := s.closeAndRemovePeer(peer); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	return nil
@@ -174,9 +193,13 @@ func (s *SFUService) ProcessingOffer(
 ) error {
 	const op = "SFUService.ProcessingOffer"
 
-	if err := s.bindPeerConnectionHandlers(ctx, peer); err != nil {
+	_ = ctx
+
+	if err := s.bindPeerConnectionHandlers(peer); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
+
+	peer.ClearRenegotiationNeeded()
 
 	webrtcOffer := webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer,
@@ -196,7 +219,7 @@ func (s *SFUService) ProcessingOffer(
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	if err := s.emitPeerEvent(ctx, peer, &models.PeerEvent{
+	if err := s.emitPeerEvent(peer, &models.PeerEvent{
 		Type:   models.SendLocalAnswer,
 		Answer: peer.Conn.LocalDescription(),
 	}); err != nil {
@@ -206,7 +229,7 @@ func (s *SFUService) ProcessingOffer(
 	return nil
 }
 
-func (s *SFUService) bindPeerConnectionHandlers(ctx context.Context, peer *models.Peer) error {
+func (s *SFUService) bindPeerConnectionHandlers(peer *models.Peer) error {
 	const op = "SFUService.bindPeerConnectionHandlers"
 
 	peer.HandlersOnce.Do(func() {
@@ -215,7 +238,7 @@ func (s *SFUService) bindPeerConnectionHandlers(ctx context.Context, peer *model
 				return
 			}
 
-			if err := s.emitPeerEvent(ctx, peer, &models.PeerEvent{
+			if err := s.emitPeerEvent(peer, &models.PeerEvent{
 				Type:      models.SendLocalCandidate,
 				Candidate: c,
 			}); err != nil {
@@ -225,7 +248,7 @@ func (s *SFUService) bindPeerConnectionHandlers(ctx context.Context, peer *model
 
 		peer.Conn.OnTrack(func(remoteTrack *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 			go func() {
-				if err := s.handleRemoteTrack(ctx, peer, remoteTrack); err != nil && !errors.Is(err, context.Canceled) {
+				if err := s.handleRemoteTrack(peer, remoteTrack); err != nil && !errors.Is(err, context.Canceled) {
 					s.log.Warn("handle remote track", "peer_id", peer.ID, "room_id", peer.RoomID, "track_id", remoteTrack.ID(), "err", err)
 				}
 			}()
@@ -255,13 +278,26 @@ func (s *SFUService) GetCandidate(
 
 	_ = ctx
 
+	if sdpMlineIndex < 0 {
+		return fmt.Errorf("%s: invalid SDP m-line index: %d", op, sdpMlineIndex)
+	}
+
+	candidateInit := webrtc.ICECandidateInit{
+		Candidate: candidate,
+	}
+
+	if sdpMid != "" {
+		candidateInit.SDPMid = &sdpMid
+	}
+
 	mid := uint16(sdpMlineIndex)
-	if err := peer.Conn.AddICECandidate(webrtc.ICECandidateInit{
-		Candidate:        candidate,
-		SDPMid:           &sdpMid,
-		SDPMLineIndex:    &mid,
-		UsernameFragment: &usernameFragment,
-	}); err != nil {
+	candidateInit.SDPMLineIndex = &mid
+
+	if usernameFragment != "" {
+		candidateInit.UsernameFragment = &usernameFragment
+	}
+
+	if err := peer.Conn.AddICECandidate(candidateInit); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
@@ -269,7 +305,6 @@ func (s *SFUService) GetCandidate(
 }
 
 func (s *SFUService) handleRemoteTrack(
-	ctx context.Context,
 	peer *models.Peer,
 	remoteTrack *webrtc.TrackRemote,
 ) error {
@@ -297,6 +332,9 @@ func (s *SFUService) handleRemoteTrack(
 		if err := s.storage.RemoveTrack(peer.RoomID, publishedTrack.ID); err != nil {
 			s.log.Warn("remove published track", "peer_id", peer.ID, "room_id", peer.RoomID, "track_id", publishedTrack.ID, "err", err)
 		}
+		if err := s.removePublishedTracksFromPeers(peer.RoomID, []*models.PublishedTrack{publishedTrack}); err != nil {
+			s.log.Warn("detach published track from peers", "peer_id", peer.ID, "room_id", peer.RoomID, "track_id", publishedTrack.ID, "err", err)
+		}
 	}()
 
 	receivers, err := s.storage.PeersExcept(peer.RoomID, peer.ID)
@@ -304,17 +342,27 @@ func (s *SFUService) handleRemoteTrack(
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
+	affectedPeers := make([]*models.Peer, 0, len(receivers))
 	for _, receiver := range receivers {
-		if err := s.sendLocalTrack(receiver, localTrack); err != nil {
+		sent, err := s.sendLocalTrack(receiver, publishedTrack)
+		if err != nil {
 			s.log.Warn("send published track to peer", "from_peer_id", peer.ID, "to_peer_id", receiver.ID, "room_id", peer.RoomID, "track_id", publishedTrack.ID, "err", err)
+			continue
 		}
+		if sent {
+			affectedPeers = append(affectedPeers, receiver)
+		}
+	}
+
+	if err := s.requestRenegotiationForPeers(affectedPeers); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	rtpBuf := make([]byte, 1500)
 	for {
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
+		case <-peer.LifetimeCtx.Done():
+			return peer.LifetimeCtx.Err()
 		default:
 		}
 
@@ -332,13 +380,18 @@ func (s *SFUService) handleRemoteTrack(
 	}
 }
 
-func (s *SFUService) sendLocalTrack(toPeer *models.Peer, localTrack *webrtc.TrackLocalStaticRTP) error {
+func (s *SFUService) sendLocalTrack(toPeer *models.Peer, publishedTrack *models.PublishedTrack) (bool, error) {
 	const op = "SFUService.sendLocalTrack"
 
-	rtpSender, err := toPeer.Conn.AddTrack(localTrack)
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
+	if toPeer.HasTrackSender(publishedTrack.ID) {
+		return false, nil
 	}
+
+	rtpSender, err := toPeer.Conn.AddTrack(publishedTrack.Track)
+	if err != nil {
+		return false, fmt.Errorf("%s: %w", op, err)
+	}
+	toPeer.BindTrackSender(publishedTrack.ID, rtpSender)
 
 	go func() {
 		rtcpBuf := make([]byte, 1500)
@@ -349,7 +402,7 @@ func (s *SFUService) sendLocalTrack(toPeer *models.Peer, localTrack *webrtc.Trac
 		}
 	}()
 
-	return nil
+	return true, nil
 }
 
 func (s *SFUService) newPeer(roomID, peerID uuid.UUID) (*models.Peer, error) {
@@ -360,20 +413,25 @@ func (s *SFUService) newPeer(roomID, peerID uuid.UUID) (*models.Peer, error) {
 		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 
+	lifetimeCtx, cancel := context.WithCancel(context.Background())
+
 	return &models.Peer{
-		ID:     peerID,
-		RoomID: roomID,
-		Conn:   conn,
-		Events: make(chan *models.PeerEvent, 16),
+		ID:           peerID,
+		RoomID:       roomID,
+		Conn:         conn,
+		Events:       make(chan *models.PeerEvent, 16),
+		LifetimeCtx:  lifetimeCtx,
+		Cancel:       cancel,
+		TrackSenders: make(map[string]*webrtc.RTPSender),
 	}, nil
 }
 
-func (s *SFUService) emitPeerEvent(ctx context.Context, peer *models.Peer, evt *models.PeerEvent) error {
+func (s *SFUService) emitPeerEvent(peer *models.Peer, evt *models.PeerEvent) error {
 	const op = "SFUService.emitPeerEvent"
 
 	select {
-	case <-ctx.Done():
-		return fmt.Errorf("%s: %w", op, ctx.Err())
+	case <-peer.LifetimeCtx.Done():
+		return fmt.Errorf("%s: %w", op, peer.LifetimeCtx.Err())
 	case peer.Events <- evt:
 		return nil
 	}
@@ -382,8 +440,15 @@ func (s *SFUService) emitPeerEvent(ctx context.Context, peer *models.Peer, evt *
 func (s *SFUService) closeAndRemovePeer(peer *models.Peer) error {
 	const op = "SFUService.closeAndRemovePeer"
 
-	if _, err := s.storage.RemovePeer(peer.RoomID, peer.ID); err != nil {
+	peer.Cancel()
+
+	_, removedTracks, err := s.storage.RemovePeer(peer.RoomID, peer.ID)
+	if err != nil {
 		s.log.Debug("peer already removed from storage", "room_id", peer.RoomID, "peer_id", peer.ID, "err", err)
+	}
+
+	if err := s.removePublishedTracksFromPeers(peer.RoomID, removedTracks); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	if err := peer.Conn.Close(); err != nil {
@@ -391,6 +456,76 @@ func (s *SFUService) closeAndRemovePeer(peer *models.Peer) error {
 	}
 
 	return nil
+}
+
+func (s *SFUService) requestRenegotiation(peer *models.Peer) error {
+	if !peer.MarkRenegotiationNeeded() {
+		return nil
+	}
+
+	return s.emitPeerEvent(peer, &models.PeerEvent{
+		Type:  models.RequestRenegotiate,
+		State: renegotiationNeededState,
+	})
+}
+
+func (s *SFUService) requestRenegotiationForPeers(peers []*models.Peer) error {
+	for _, peer := range peers {
+		if err := s.requestRenegotiation(peer); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (s *SFUService) removePublishedTracksFromPeers(roomID uuid.UUID, tracks []*models.PublishedTrack) error {
+	if len(tracks) == 0 {
+		return nil
+	}
+
+	affectedPeers := make(map[uuid.UUID]*models.Peer)
+
+	for _, publishedTrack := range tracks {
+		receivers, err := s.storage.PeersExcept(roomID, publishedTrack.PublisherID)
+		if err != nil {
+			s.log.Debug("skip published track cleanup because room is unavailable", "room_id", roomID, "track_id", publishedTrack.ID, "err", err)
+			return nil
+		}
+
+		for _, receiver := range receivers {
+			removed, err := s.removeLocalTrack(receiver, publishedTrack.ID)
+			if err != nil {
+				s.log.Warn("remove published track from peer", "room_id", roomID, "track_id", publishedTrack.ID, "peer_id", receiver.ID, "err", err)
+				continue
+			}
+			if removed {
+				affectedPeers[receiver.ID] = receiver
+			}
+		}
+	}
+
+	peers := make([]*models.Peer, 0, len(affectedPeers))
+	for _, peer := range affectedPeers {
+		peers = append(peers, peer)
+	}
+
+	return s.requestRenegotiationForPeers(peers)
+}
+
+func (s *SFUService) removeLocalTrack(peer *models.Peer, trackID string) (bool, error) {
+	const op = "SFUService.removeLocalTrack"
+
+	sender := peer.RemoveTrackSender(trackID)
+	if sender == nil {
+		return false, nil
+	}
+
+	if err := peer.Conn.RemoveTrack(sender); err != nil {
+		return false, fmt.Errorf("%s: %w", op, err)
+	}
+
+	return true, nil
 }
 
 func trackKey(peerID uuid.UUID, trackID, streamID string) string {

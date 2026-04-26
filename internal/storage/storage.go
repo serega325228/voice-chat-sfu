@@ -81,7 +81,7 @@ func (s *SFUStorage) GetPeer(roomID, peerID uuid.UUID) (*models.Peer, error) {
 	return peer, nil
 }
 
-func (s *SFUStorage) RemovePeer(roomID, peerID uuid.UUID) (*models.Peer, error) {
+func (s *SFUStorage) RemovePeer(roomID, peerID uuid.UUID) (*models.Peer, []*models.PublishedTrack, error) {
 	const op = "SFUStorage.RemovePeer"
 
 	s.mu.Lock()
@@ -90,19 +90,21 @@ func (s *SFUStorage) RemovePeer(roomID, peerID uuid.UUID) (*models.Peer, error) 
 	room, ok := s.rooms[roomID]
 	if !ok {
 		err := fmt.Errorf("room %s does not exist", roomID)
-		return nil, fmt.Errorf("%s: %w", op, err)
+		return nil, nil, fmt.Errorf("%s: %w", op, err)
 	}
 
 	peer, ok := room.Peers[peerID]
 	if !ok {
 		err := fmt.Errorf("peer %s does not exist in room %s", peerID, roomID)
-		return nil, fmt.Errorf("%s: %w", op, err)
+		return nil, nil, fmt.Errorf("%s: %w", op, err)
 	}
 
 	delete(room.Peers, peerID)
 
+	removedTracks := make([]*models.PublishedTrack, 0, len(room.Tracks))
 	for key, track := range room.Tracks {
 		if track.PublisherID == peerID {
+			removedTracks = append(removedTracks, track)
 			delete(room.Tracks, key)
 		}
 	}
@@ -111,7 +113,7 @@ func (s *SFUStorage) RemovePeer(roomID, peerID uuid.UUID) (*models.Peer, error) 
 		delete(s.rooms, roomID)
 	}
 
-	return peer, nil
+	return peer, removedTracks, nil
 }
 
 func (s *SFUStorage) PeersExcept(roomID, peerID uuid.UUID) ([]*models.Peer, error) {

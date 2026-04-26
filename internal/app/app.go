@@ -22,7 +22,10 @@ type App struct {
 func New() (*App, error) {
 	const op = "App.New"
 
-	cfg := config.MustLoad()
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
 	log := logger.SetupLogger(cfg.Env)
 
 	container := newDIContainer(cfg, log)
