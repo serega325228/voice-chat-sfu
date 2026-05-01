@@ -21,7 +21,7 @@ type SessionService interface {
 	CreateSession(ctx context.Context, roomID, peerID uuid.UUID) error
 	JoinSession(ctx context.Context, roomID, peerID uuid.UUID) error
 	LeaveSession(ctx context.Context, roomID, peerID uuid.UUID) error
-	ProcessingOffer(ctx context.Context, peer *models.Peer, sdp string) error
+	ProcessingDescription(ctx context.Context, peer *models.Peer, sdp string, sdpType webrtc.SDPType) error
 	GetCandidate(
 		ctx context.Context,
 		peer *models.Peer,
@@ -204,8 +204,15 @@ func (s *serverAPI) toSignalMessage(peer *models.Peer, peerEvent *models.PeerEve
 			},
 		}
 	case models.RequestRenegotiate:
+		renegotiation := &sessionv1.RenegotiationNeeded{}
+		if peerEvent.Offer != nil {
+			renegotiation.Offer = &sessionv1.SessionDescription{
+				Type: toProtoSDPType(peerEvent.Offer.Type),
+				Sdp:  peerEvent.Offer.SDP,
+			}
+		}
 		msg.Payload = &sessionv1.SignalMessage_RenegotiationNeeded{
-			RenegotiationNeeded: &sessionv1.RenegotiationNeeded{},
+			RenegotiationNeeded: renegotiation,
 		}
 	}
 
@@ -237,16 +244,17 @@ func (s *serverAPI) handleRemoteOffer(
 	const op = "serverAPI.handleRemoteOffer"
 
 	if offer == nil || offer.GetOffer() == nil {
-		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty remote offer", op))
+		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty remote SDP", op))
 	}
-	if offer.GetOffer().GetType() != sessionv1.SdpType_SDP_TYPE_OFFER {
-		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: unsupported SDP type %s", op, offer.GetOffer().GetType().String()))
+	sdpType, err := toWebRTCSDPType(offer.GetOffer().GetType())
+	if err != nil {
+		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: %s", op, err.Error()))
 	}
 	if offer.GetOffer().GetSdp() == "" {
-		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty SDP in remote offer", op))
+		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty SDP in remote payload", op))
 	}
 
-	if err := s.service.ProcessingOffer(ctx, peer, offer.GetOffer().GetSdp()); err != nil {
+	if err := s.service.ProcessingDescription(ctx, peer, offer.GetOffer().GetSdp(), sdpType); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
@@ -310,6 +318,17 @@ func toProtoSDPType(sdpType webrtc.SDPType) sessionv1.SdpType {
 		return sessionv1.SdpType_SDP_TYPE_ANSWER
 	default:
 		return sessionv1.SdpType_SDP_TYPE_UNSPECIFIED
+	}
+}
+
+func toWebRTCSDPType(sdpType sessionv1.SdpType) (webrtc.SDPType, error) {
+	switch sdpType {
+	case sessionv1.SdpType_SDP_TYPE_OFFER:
+		return webrtc.SDPTypeOffer, nil
+	case sessionv1.SdpType_SDP_TYPE_ANSWER:
+		return webrtc.SDPTypeAnswer, nil
+	default:
+		return webrtc.SDPTypeUnknown, fmt.Errorf("unsupported SDP type %s", sdpType.String())
 	}
 }
 

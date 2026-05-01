@@ -127,6 +127,12 @@ func (s *SFUService) JoinSession(ctx context.Context, roomID, peerID uuid.UUID) 
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
+	otherPeers, err := s.storage.PeersExcept(roomID, peerID)
+	if err != nil {
+		_ = s.closeAndRemovePeer(peer)
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
 	publishedTracks, err := s.storage.Tracks(roomID)
 	if err != nil {
 		_ = s.closeAndRemovePeer(peer)
@@ -153,6 +159,10 @@ func (s *SFUService) JoinSession(ctx context.Context, roomID, peerID uuid.UUID) 
 		if err := s.requestRenegotiation(peer); err != nil {
 			return fmt.Errorf("%s: %w", op, err)
 		}
+	}
+
+	if err := s.requestRenegotiationForPeers(otherPeers); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	return nil
@@ -186,18 +196,32 @@ func (s *SFUService) GetPeer(roomID, peerID uuid.UUID) (*models.Peer, error) {
 	return peer, nil
 }
 
-func (s *SFUService) ProcessingOffer(
+func (s *SFUService) ProcessingDescription(
 	ctx context.Context,
 	peer *models.Peer,
 	sdp string,
+	sdpType webrtc.SDPType,
 ) error {
-	const op = "SFUService.ProcessingOffer"
+	const op = "SFUService.ProcessingDescription"
 
 	_ = ctx
 
 	if err := s.bindPeerConnectionHandlers(peer); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
+
+	switch sdpType {
+	case webrtc.SDPTypeOffer:
+		return s.processRemoteOffer(peer, sdp)
+	case webrtc.SDPTypeAnswer:
+		return s.processRemoteAnswer(peer, sdp)
+	default:
+		return fmt.Errorf("%s: unsupported SDP type %s", op, sdpType.String())
+	}
+}
+
+func (s *SFUService) processRemoteOffer(peer *models.Peer, sdp string) error {
+	const op = "SFUService.processRemoteOffer"
 
 	peer.ClearRenegotiationNeeded()
 
@@ -225,6 +249,23 @@ func (s *SFUService) ProcessingOffer(
 	}); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
+
+	return nil
+}
+
+func (s *SFUService) processRemoteAnswer(peer *models.Peer, sdp string) error {
+	const op = "SFUService.processRemoteAnswer"
+
+	webrtcAnswer := webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  sdp,
+	}
+
+	if err := peer.Conn.SetRemoteDescription(webrtcAnswer); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	peer.ClearRenegotiationNeeded()
 
 	return nil
 }
@@ -463,10 +504,32 @@ func (s *SFUService) requestRenegotiation(peer *models.Peer) error {
 		return nil
 	}
 
-	return s.emitPeerEvent(peer, &models.PeerEvent{
+	offer, err := peer.Conn.CreateOffer(nil)
+	if err != nil {
+		peer.ClearRenegotiationNeeded()
+		return err
+	}
+
+	if err := peer.Conn.SetLocalDescription(offer); err != nil {
+		peer.ClearRenegotiationNeeded()
+		return err
+	}
+
+	localOffer := peer.Conn.LocalDescription()
+	if localOffer == nil {
+		localOffer = &offer
+	}
+
+	if err := s.emitPeerEvent(peer, &models.PeerEvent{
 		Type:  models.RequestRenegotiate,
+		Offer: localOffer,
 		State: renegotiationNeededState,
-	})
+	}); err != nil {
+		peer.ClearRenegotiationNeeded()
+		return err
+	}
+
+	return nil
 }
 
 func (s *SFUService) requestRenegotiationForPeers(peers []*models.Peer) error {

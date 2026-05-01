@@ -6,6 +6,7 @@ type PeerEvent struct {
 	Type      PeerEventType
 	Candidate *webrtc.ICECandidate
 	Answer    *webrtc.SessionDescription
+	Offer     *webrtc.SessionDescription
 	State     string
 }
 
