@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"voice-chat-sfu/internal/models"
 
 	"github.com/google/uuid"
@@ -96,19 +95,15 @@ func (s *serverAPI) LeaveSession(
 	return &sessionv1.LeaveSessionResponse{}, nil
 }
 
-func (s *serverAPI) SignalPeer(
-	stream sessionv1.Session_SignalPeerServer,
+func (s *serverAPI) OpenSignalStream(
+	req *sessionv1.OpenSignalStreamRequest,
+	stream grpc.ServerStreamingServer[sessionv1.SignalMessage],
 ) error {
-	const op = "serverAPI.SignalPeer"
+	const op = "serverAPI.OpenSignalStream"
 
 	ctx := stream.Context()
 
-	firstMsg, err := stream.Recv()
-	if err != nil {
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
-	roomID, peerID, err := parseIDs(firstMsg.GetSessionId(), firstMsg.GetPeerId())
+	roomID, peerID, err := parseIDs(req.GetSessionId(), req.GetPeerId())
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -122,51 +117,53 @@ func (s *serverAPI) SignalPeer(
 		_ = s.service.LeaveSession(context.Background(), peer.RoomID, peer.ID)
 	}()
 
-	errCh := make(chan error, 2)
-
-	go func() {
-		if err := s.handleIncoming(ctx, peer, firstMsg); err != nil {
-			errCh <- err
-			return
-		}
-
-		for {
-			msg, err := stream.Recv()
-			if err != nil {
-				errCh <- err
-				return
+	for {
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return nil
 			}
-
-			if err := s.handleIncoming(ctx, peer, msg); err != nil {
-				errCh <- err
-				return
+			return fmt.Errorf("%s: %w", op, ctx.Err())
+		case <-peer.LifetimeCtx.Done():
+			if errors.Is(peer.LifetimeCtx.Err(), context.Canceled) {
+				return nil
+			}
+			return fmt.Errorf("%s: %w", op, peer.LifetimeCtx.Err())
+		case evt := <-peer.Events:
+			if err := stream.Send(s.toSignalMessage(peer, evt)); err != nil {
+				return fmt.Errorf("%s: %w", op, err)
 			}
 		}
-	}()
-
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				errCh <- ctx.Err()
-				return
-			case <-peer.LifetimeCtx.Done():
-				errCh <- peer.LifetimeCtx.Err()
-				return
-			case evt := <-peer.Events:
-				if err := stream.Send(s.toSignalMessage(peer, evt)); err != nil {
-					errCh <- err
-					return
-				}
-			}
-		}
-	}()
-
-	err = <-errCh
-	if err == io.EOF || errors.Is(err, context.Canceled) {
-		return nil
 	}
-	return fmt.Errorf("%s: %w", op, err)
+}
+
+func (s *serverAPI) SendSignal(
+	ctx context.Context,
+	req *sessionv1.SendSignalRequest,
+) (*sessionv1.SendSignalResponse, error) {
+	const op = "serverAPI.SendSignal"
+
+	msg := req.GetMessage()
+	if msg == nil {
+		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty signal message", op))
+	}
+
+	roomID, peerID, err := parseIDs(msg.GetSessionId(), msg.GetPeerId())
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	peer, err := s.service.GetPeer(roomID, peerID)
+	if err != nil {
+		wrappedErr := fmt.Errorf("%s: %w", op, err)
+		return nil, status.Error(codes.NotFound, wrappedErr.Error())
+	}
+
+	if err := s.handleIncoming(ctx, peer, msg); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	return &sessionv1.SendSignalResponse{}, nil
 }
 
 func (s *serverAPI) toSignalMessage(peer *models.Peer, peerEvent *models.PeerEvent) *sessionv1.SignalMessage {
@@ -180,9 +177,9 @@ func (s *serverAPI) toSignalMessage(peer *models.Peer, peerEvent *models.PeerEve
 		if peerEvent.Answer == nil {
 			return msg
 		}
-		msg.Payload = &sessionv1.SignalMessage_LocalAnswer{
-			LocalAnswer: &sessionv1.LocalAnswer{
-				Answer: &sessionv1.SessionDescription{
+		msg.Payload = &sessionv1.SignalMessage_LocalDescription{
+			LocalDescription: &sessionv1.LocalDescription{
+				Description: &sessionv1.SessionDescription{
 					Type: toProtoSDPType(peerEvent.Answer.Type),
 					Sdp:  peerEvent.Answer.SDP,
 				},
@@ -227,8 +224,8 @@ func (s *serverAPI) handleIncoming(
 	const op = "serverAPI.handleIncoming"
 
 	switch x := msg.Payload.(type) {
-	case *sessionv1.SignalMessage_RemoteOffer:
-		return s.handleRemoteOffer(ctx, peer, x.RemoteOffer)
+	case *sessionv1.SignalMessage_RemoteDescription:
+		return s.handleRemoteDescription(ctx, peer, x.RemoteDescription)
 	case *sessionv1.SignalMessage_RemoteIceCandidate:
 		return s.handleRemoteIceCandidate(ctx, peer, x.RemoteIceCandidate)
 	default:
@@ -236,25 +233,27 @@ func (s *serverAPI) handleIncoming(
 	}
 }
 
-func (s *serverAPI) handleRemoteOffer(
+func (s *serverAPI) handleRemoteDescription(
 	ctx context.Context,
 	peer *models.Peer,
-	offer *sessionv1.RemoteOffer,
+	remoteDescription *sessionv1.RemoteDescription,
 ) error {
-	const op = "serverAPI.handleRemoteOffer"
+	const op = "serverAPI.handleRemoteDescription"
 
-	if offer == nil || offer.GetOffer() == nil {
+	if remoteDescription == nil || remoteDescription.GetDescription() == nil {
 		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty remote SDP", op))
 	}
-	sdpType, err := toWebRTCSDPType(offer.GetOffer().GetType())
+	description := remoteDescription.GetDescription()
+
+	sdpType, err := toWebRTCSDPType(description.GetType())
 	if err != nil {
 		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: %s", op, err.Error()))
 	}
-	if offer.GetOffer().GetSdp() == "" {
+	if description.GetSdp() == "" {
 		return status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty SDP in remote payload", op))
 	}
 
-	if err := s.service.ProcessingDescription(ctx, peer, offer.GetOffer().GetSdp(), sdpType); err != nil {
+	if err := s.service.ProcessingDescription(ctx, peer, description.GetSdp(), sdpType); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 

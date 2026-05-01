@@ -1,4 +1,4 @@
 env: "local"
 grpc_server:
-  port: 8085
+  port: 8081
   shutdown_timeout: "15s"

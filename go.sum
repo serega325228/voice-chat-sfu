@@ -60,6 +60,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/serega325228/voice-chat-sfu-protos v0.0.6 h1:VvuIZeGYMAYAXK5Ow/RWFglHshy7owrhqdsMerHcT9Q=
 github.com/serega325228/voice-chat-sfu-protos v0.0.6/go.mod h1:bKHle2flDNr0ODqXKfakh+7yGkvsxLWka68xR8Gdt+o=
+github.com/serega325228/voice-chat-sfu-protos v0.0.7 h1:TjJtMKCEpFmGN0RR4KiB835QwcaUhzPrFRqhyZWD82g=
+github.com/serega325228/voice-chat-sfu-protos v0.0.7/go.mod h1:bKHle2flDNr0ODqXKfakh+7yGkvsxLWka68xR8Gdt+o=
 github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu7U=
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/wlynxg/anet v0.0.5 h1:J3VJGi1gvo0JwZ/P1/Yc/8p63SoW98B5dHkYDmpgvvU=
