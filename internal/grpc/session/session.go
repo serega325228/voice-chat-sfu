@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"voice-chat-sfu/internal/models"
 
 	"github.com/google/uuid"
@@ -95,15 +96,19 @@ func (s *serverAPI) LeaveSession(
 	return &sessionv1.LeaveSessionResponse{}, nil
 }
 
-func (s *serverAPI) OpenSignalStream(
-	req *sessionv1.OpenSignalStreamRequest,
-	stream grpc.ServerStreamingServer[sessionv1.SignalMessage],
+func (s *serverAPI) SignalPeer(
+	stream sessionv1.Session_SignalPeerServer,
 ) error {
-	const op = "serverAPI.OpenSignalStream"
+	const op = "serverAPI.SignalPeer"
 
 	ctx := stream.Context()
 
-	roomID, peerID, err := parseIDs(req.GetSessionId(), req.GetPeerId())
+	firstMsg, err := stream.Recv()
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	roomID, peerID, err := parseIDs(firstMsg.GetSessionId(), firstMsg.GetPeerId())
 	if err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
@@ -117,53 +122,51 @@ func (s *serverAPI) OpenSignalStream(
 		_ = s.service.LeaveSession(context.Background(), peer.RoomID, peer.ID)
 	}()
 
-	for {
-		select {
-		case <-ctx.Done():
-			if errors.Is(ctx.Err(), context.Canceled) {
-				return nil
+	errCh := make(chan error, 2)
+
+	go func() {
+		if err := s.handleIncoming(ctx, peer, firstMsg); err != nil {
+			errCh <- err
+			return
+		}
+
+		for {
+			msg, err := stream.Recv()
+			if err != nil {
+				errCh <- err
+				return
 			}
-			return fmt.Errorf("%s: %w", op, ctx.Err())
-		case <-peer.LifetimeCtx.Done():
-			if errors.Is(peer.LifetimeCtx.Err(), context.Canceled) {
-				return nil
-			}
-			return fmt.Errorf("%s: %w", op, peer.LifetimeCtx.Err())
-		case evt := <-peer.Events:
-			if err := stream.Send(s.toSignalMessage(peer, evt)); err != nil {
-				return fmt.Errorf("%s: %w", op, err)
+
+			if err := s.handleIncoming(ctx, peer, msg); err != nil {
+				errCh <- err
+				return
 			}
 		}
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			case <-peer.LifetimeCtx.Done():
+				errCh <- peer.LifetimeCtx.Err()
+				return
+			case evt := <-peer.Events:
+				if err := stream.Send(s.toSignalMessage(peer, evt)); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}
+	}()
+
+	err = <-errCh
+	if err == io.EOF || errors.Is(err, context.Canceled) {
+		return nil
 	}
-}
-
-func (s *serverAPI) SendSignal(
-	ctx context.Context,
-	req *sessionv1.SendSignalRequest,
-) (*sessionv1.SendSignalResponse, error) {
-	const op = "serverAPI.SendSignal"
-
-	msg := req.GetMessage()
-	if msg == nil {
-		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("%s: empty signal message", op))
-	}
-
-	roomID, peerID, err := parseIDs(msg.GetSessionId(), msg.GetPeerId())
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-
-	peer, err := s.service.GetPeer(roomID, peerID)
-	if err != nil {
-		wrappedErr := fmt.Errorf("%s: %w", op, err)
-		return nil, status.Error(codes.NotFound, wrappedErr.Error())
-	}
-
-	if err := s.handleIncoming(ctx, peer, msg); err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-
-	return &sessionv1.SendSignalResponse{}, nil
+	return fmt.Errorf("%s: %w", op, err)
 }
 
 func (s *serverAPI) toSignalMessage(peer *models.Peer, peerEvent *models.PeerEvent) *sessionv1.SignalMessage {

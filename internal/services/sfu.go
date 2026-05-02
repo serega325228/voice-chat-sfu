@@ -127,19 +127,12 @@ func (s *SFUService) JoinSession(ctx context.Context, roomID, peerID uuid.UUID) 
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	otherPeers, err := s.storage.PeersExcept(roomID, peerID)
-	if err != nil {
-		_ = s.closeAndRemovePeer(peer)
-		return fmt.Errorf("%s: %w", op, err)
-	}
-
 	publishedTracks, err := s.storage.Tracks(roomID)
 	if err != nil {
 		_ = s.closeAndRemovePeer(peer)
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	addedTrack := false
 	for _, publishedTrack := range publishedTracks {
 		if publishedTrack.PublisherID == peer.ID {
 			continue
@@ -150,19 +143,9 @@ func (s *SFUService) JoinSession(ctx context.Context, roomID, peerID uuid.UUID) 
 			s.log.Warn("attach existing track to joined peer", "room_id", roomID, "peer_id", peerID, "track_id", publishedTrack.ID, "err", err)
 			continue
 		}
-		if sent {
-			addedTrack = true
+		if !sent {
+			continue
 		}
-	}
-
-	if addedTrack {
-		if err := s.requestRenegotiation(peer); err != nil {
-			return fmt.Errorf("%s: %w", op, err)
-		}
-	}
-
-	if err := s.requestRenegotiationForPeers(otherPeers); err != nil {
-		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	return nil

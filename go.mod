@@ -7,7 +7,7 @@ require (
 	github.com/ilyakaznacheev/cleanenv v1.5.0
 	github.com/pion/interceptor v0.1.44
 	github.com/pion/webrtc/v4 v4.2.11
-	github.com/serega325228/voice-chat-sfu-protos v0.0.7
+	github.com/serega325228/voice-chat-sfu-protos v0.0.9
 	google.golang.org/grpc v1.80.0
 )
 
