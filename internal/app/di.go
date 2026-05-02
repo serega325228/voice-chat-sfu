@@ -5,6 +5,7 @@ import (
 	"sync"
 	grpcapp "voice-chat-sfu/internal/app/grpc"
 	"voice-chat-sfu/internal/config"
+	"voice-chat-sfu/internal/grpc/session"
 	"voice-chat-sfu/internal/services"
 	"voice-chat-sfu/internal/storage"
 )
@@ -55,7 +56,15 @@ func (c *diContainer) GRPCApp() (*grpcapp.App, error) {
 			return
 		}
 
-		c.grpcApp = grpcapp.New(c.log, c.cfg.GRPCServer.Port, sessionService)
+		c.grpcApp = grpcapp.New(c.log, grpcapp.Config{
+			Port:                c.cfg.GRPCServer.Port,
+			KeepaliveTime:       c.cfg.GRPCServer.Keepalive.Time,
+			KeepaliveTimeout:    c.cfg.GRPCServer.Keepalive.Timeout,
+			KeepaliveMinTime:    c.cfg.GRPCServer.Keepalive.MinTime,
+			PermitWithoutStream: c.cfg.GRPCServer.Keepalive.PermitWithoutStream,
+		}, session.Config{
+			StreamReattachGracePeriod: c.cfg.Signaling.ReattachGracePeriod,
+		}, sessionService)
 	})
 
 	if c.sessionServiceErr != nil {

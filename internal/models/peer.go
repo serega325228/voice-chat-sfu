@@ -3,6 +3,7 @@ package models
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
@@ -20,6 +21,11 @@ type Peer struct {
 	sendersMu            sync.Mutex
 	TrackSenders         map[string]*webrtc.RTPSender
 	renegotiationPending bool
+
+	attachmentMu         sync.Mutex
+	attachmentGeneration uint64
+	attached             bool
+	detachTimer          *time.Timer
 }
 
 func (p *Peer) HasTrackSender(trackID string) bool {
@@ -64,4 +70,60 @@ func (p *Peer) ClearRenegotiationNeeded() {
 	defer p.sendersMu.Unlock()
 
 	p.renegotiationPending = false
+}
+
+func (p *Peer) Attach() uint64 {
+	p.attachmentMu.Lock()
+	defer p.attachmentMu.Unlock()
+
+	if p.detachTimer != nil {
+		p.detachTimer.Stop()
+		p.detachTimer = nil
+	}
+
+	p.attachmentGeneration++
+	p.attached = true
+
+	return p.attachmentGeneration
+}
+
+func (p *Peer) IsCurrentAttachment(generation uint64) bool {
+	p.attachmentMu.Lock()
+	defer p.attachmentMu.Unlock()
+
+	return p.attached && p.attachmentGeneration == generation
+}
+
+func (p *Peer) Detach(generation uint64, gracePeriod time.Duration, onExpire func()) {
+	p.attachmentMu.Lock()
+	defer p.attachmentMu.Unlock()
+
+	if p.attachmentGeneration != generation || !p.attached {
+		return
+	}
+
+	p.attached = false
+
+	if p.detachTimer != nil {
+		p.detachTimer.Stop()
+		p.detachTimer = nil
+	}
+
+	if gracePeriod <= 0 {
+		go onExpire()
+		return
+	}
+
+	currentGeneration := generation
+	p.detachTimer = time.AfterFunc(gracePeriod, func() {
+		p.attachmentMu.Lock()
+		defer p.attachmentMu.Unlock()
+
+		if p.attached || p.attachmentGeneration != currentGeneration {
+			return
+		}
+
+		p.detachTimer = nil
+		go onExpire()
+	})
 }

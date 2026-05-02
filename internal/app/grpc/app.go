@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"time"
 	"voice-chat-sfu/internal/grpc/session"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 type App struct {
@@ -17,18 +19,36 @@ type App struct {
 	port       int
 }
 
+type Config struct {
+	Port                int
+	KeepaliveTime       time.Duration
+	KeepaliveTimeout    time.Duration
+	KeepaliveMinTime    time.Duration
+	PermitWithoutStream bool
+}
+
 func New(
 	log *slog.Logger,
-	port int,
+	cfg Config,
+	sessionCfg session.Config,
 	sessionService session.SessionService,
 ) *App {
-	gRPCServer := grpc.NewServer()
-	session.Register(gRPCServer, sessionService)
+	gRPCServer := grpc.NewServer(
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    cfg.KeepaliveTime,
+			Timeout: cfg.KeepaliveTimeout,
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             cfg.KeepaliveMinTime,
+			PermitWithoutStream: cfg.PermitWithoutStream,
+		}),
+	)
+	session.Register(gRPCServer, sessionService, sessionCfg)
 
 	return &App{
 		log:        log,
 		gRPCServer: gRPCServer,
-		port:       port,
+		port:       cfg.Port,
 	}
 }
 

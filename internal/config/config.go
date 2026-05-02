@@ -13,11 +13,24 @@ var ErrConfigPathNotSet = errors.New("CONFIG_PATH is not set")
 type Config struct {
 	Env        string     `yaml:"env" env:"ENV" env-default:"development"`
 	GRPCServer GRPCServer `yaml:"grpc_server"`
+	Signaling  Signaling  `yaml:"signaling"`
 }
 
 type GRPCServer struct {
-	Port            int           `yaml:"port" env-default:"8085"`
-	ShutdownTimeout time.Duration `yaml:"shutdown_timeout" env-default:"15s"`
+	Port            int                 `yaml:"port" env-default:"8085"`
+	ShutdownTimeout time.Duration       `yaml:"shutdown_timeout" env-default:"15s"`
+	Keepalive       GRPCServerKeepalive `yaml:"keepalive"`
+}
+
+type GRPCServerKeepalive struct {
+	Time                time.Duration `yaml:"time" env-default:"20s"`
+	Timeout             time.Duration `yaml:"timeout" env-default:"10s"`
+	MinTime             time.Duration `yaml:"min_time" env-default:"10s"`
+	PermitWithoutStream bool          `yaml:"permit_without_stream" env-default:"true"`
+}
+
+type Signaling struct {
+	ReattachGracePeriod time.Duration `yaml:"reattach_grace_period" env-default:"30s"`
 }
 
 func (c *Config) ServerShutdownTimeout() time.Duration {

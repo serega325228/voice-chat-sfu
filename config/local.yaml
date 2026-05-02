@@ -2,3 +2,10 @@ env: "local"
 grpc_server:
   port: 8081
   shutdown_timeout: "15s"
+  keepalive:
+    time: "20s"
+    timeout: "10s"
+    min_time: "10s"
+    permit_without_stream: true
+signaling:
+  reattach_grace_period: "30s"

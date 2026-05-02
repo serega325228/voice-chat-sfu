@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 	"voice-chat-sfu/internal/models"
 
 	"github.com/google/uuid"
@@ -16,6 +17,10 @@ import (
 )
 
 const negotiationNeededState = "negotiation_needed"
+
+type Config struct {
+	StreamReattachGracePeriod time.Duration
+}
 
 type SessionService interface {
 	CreateSession(ctx context.Context, roomID, peerID uuid.UUID) error
@@ -36,10 +41,11 @@ type SessionService interface {
 type serverAPI struct {
 	sessionv1.UnimplementedSessionServer
 	service SessionService
+	cfg     Config
 }
 
-func Register(gRPC *grpc.Server, service SessionService) {
-	sessionv1.RegisterSessionServer(gRPC, &serverAPI{service: service})
+func Register(gRPC *grpc.Server, service SessionService, cfg Config) {
+	sessionv1.RegisterSessionServer(gRPC, &serverAPI{service: service, cfg: cfg})
 }
 
 func (s *serverAPI) CreateSession(
@@ -118,14 +124,12 @@ func (s *serverAPI) SignalPeer(
 		wrappedErr := fmt.Errorf("%s: %w", op, err)
 		return status.Error(codes.NotFound, wrappedErr.Error())
 	}
-	defer func() {
-		_ = s.service.LeaveSession(context.Background(), peer.RoomID, peer.ID)
-	}()
+	attachmentGeneration := peer.Attach()
 
 	errCh := make(chan error, 2)
 
 	go func() {
-		if err := s.handleIncoming(ctx, peer, firstMsg); err != nil {
+		if err := s.handleIncoming(ctx, peer, attachmentGeneration, firstMsg); err != nil {
 			errCh <- err
 			return
 		}
@@ -137,7 +141,7 @@ func (s *serverAPI) SignalPeer(
 				return
 			}
 
-			if err := s.handleIncoming(ctx, peer, msg); err != nil {
+			if err := s.handleIncoming(ctx, peer, attachmentGeneration, msg); err != nil {
 				errCh <- err
 				return
 			}
@@ -154,6 +158,10 @@ func (s *serverAPI) SignalPeer(
 				errCh <- peer.LifetimeCtx.Err()
 				return
 			case evt := <-peer.Events:
+				if !peer.IsCurrentAttachment(attachmentGeneration) {
+					errCh <- context.Canceled
+					return
+				}
 				if err := stream.Send(s.toSignalMessage(peer, evt)); err != nil {
 					errCh <- err
 					return
@@ -163,6 +171,9 @@ func (s *serverAPI) SignalPeer(
 	}()
 
 	err = <-errCh
+	peer.Detach(attachmentGeneration, s.cfg.StreamReattachGracePeriod, func() {
+		_ = s.service.LeaveSession(context.Background(), peer.RoomID, peer.ID)
+	})
 	if err == io.EOF || errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -222,9 +233,18 @@ func (s *serverAPI) toSignalMessage(peer *models.Peer, peerEvent *models.PeerEve
 func (s *serverAPI) handleIncoming(
 	ctx context.Context,
 	peer *models.Peer,
+	attachmentGeneration uint64,
 	msg *sessionv1.SignalMessage,
 ) error {
 	const op = "serverAPI.handleIncoming"
+
+	if !peer.IsCurrentAttachment(attachmentGeneration) {
+		return context.Canceled
+	}
+
+	if msg.GetPayload() == nil {
+		return nil
+	}
 
 	switch x := msg.Payload.(type) {
 	case *sessionv1.SignalMessage_RemoteDescription:
