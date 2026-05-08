@@ -26,15 +26,21 @@ type SFUStorage interface {
 	Tracks(roomID uuid.UUID) ([]*models.PublishedTrack, error)
 }
 
+type Config struct {
+	ICEServers []webrtc.ICEServer
+}
+
 type SFUService struct {
 	log     *slog.Logger
 	storage SFUStorage
 	api     *webrtc.API
+	config  Config
 }
 
 func NewSFUService(
 	log *slog.Logger,
 	storage SFUStorage,
+	config Config,
 ) (*SFUService, error) {
 	const op = "SFUService.NewSFUService"
 
@@ -57,6 +63,7 @@ func NewSFUService(
 		log:     log,
 		storage: storage,
 		api:     api,
+		config:  config,
 	}, nil
 }
 
@@ -64,11 +71,7 @@ func (s *SFUService) initConn() (*webrtc.PeerConnection, error) {
 	const op = "SFUService.initConn"
 
 	peerConnectionConfig := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
-			},
-		},
+		ICEServers: append([]webrtc.ICEServer(nil), s.config.ICEServers...),
 	}
 
 	peerConnection, err := s.api.NewPeerConnection(peerConnectionConfig)

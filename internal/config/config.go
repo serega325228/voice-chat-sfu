@@ -14,6 +14,7 @@ type Config struct {
 	Env        string     `yaml:"env" env:"ENV" env-default:"development"`
 	GRPCServer GRPCServer `yaml:"grpc_server"`
 	Signaling  Signaling  `yaml:"signaling"`
+	WebRTC     WebRTC     `yaml:"webrtc"`
 }
 
 type GRPCServer struct {
@@ -31,6 +32,18 @@ type GRPCServerKeepalive struct {
 
 type Signaling struct {
 	ReattachGracePeriod time.Duration `yaml:"reattach_grace_period" env-default:"30s"`
+}
+
+type WebRTC struct {
+	DefaultTURNUsername   string      `env:"TURN_USER" env-default:"voicechat"`
+	DefaultTURNCredential string      `env:"TURN_PASSWORD" env-default:"voicechatpass"`
+	ICEServers            []ICEServer `yaml:"ice_servers"`
+}
+
+type ICEServer struct {
+	URLs       []string `yaml:"urls"`
+	Username   string   `yaml:"username"`
+	Credential string   `yaml:"credential"`
 }
 
 func (c *Config) ServerShutdownTimeout() time.Duration {

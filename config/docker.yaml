@@ -1,0 +1,17 @@
+env: "docker"
+grpc_server:
+  port: 8081
+  shutdown_timeout: "15s"
+  keepalive:
+    time: "20s"
+    timeout: "10s"
+    min_time: "10s"
+    permit_without_stream: true
+signaling:
+  reattach_grace_period: "30s"
+webrtc:
+  ice_servers:
+    - urls:
+        - "stun:coturn:3478"
+        - "turn:coturn:3478?transport=udp"
+        - "turn:coturn:3478?transport=tcp"

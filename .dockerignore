@@ -1,0 +1,6 @@
+.git
+.codex
+tmp
+bin
+dist
+node_modules
