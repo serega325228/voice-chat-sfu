@@ -36,7 +36,7 @@ func newDIContainer(cfg *config.Config, log *slog.Logger) *diContainer {
 
 func (c *diContainer) Storage() *storage.SFUStorage {
 	c.storageOnce.Do(func() {
-		c.storage = storage.NewSFUStorage()
+		c.storage = storage.NewSFUStorage(c.cfg.Signaling.EmptyRoomTTL)
 	})
 
 	return c.storage

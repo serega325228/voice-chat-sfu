@@ -9,6 +9,7 @@ grpc_server:
     permit_without_stream: true
 signaling:
   reattach_grace_period: "30s"
+  empty_room_ttl: "5m"
 webrtc:
   ice_servers:
     - urls:

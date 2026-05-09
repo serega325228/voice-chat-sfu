@@ -3,19 +3,28 @@ package storage
 import (
 	"fmt"
 	"sync"
+	"time"
 	"voice-chat-sfu/internal/models"
 
 	"github.com/google/uuid"
 )
 
 type SFUStorage struct {
-	mu    sync.RWMutex
-	rooms map[uuid.UUID]*models.Room
+	mu               sync.RWMutex
+	rooms            map[uuid.UUID]*models.Room
+	roomCleanupTimers map[uuid.UUID]*time.Timer
+	emptyRoomTTL     time.Duration
 }
 
-func NewSFUStorage() *SFUStorage {
+func NewSFUStorage(emptyRoomTTL time.Duration) *SFUStorage {
+	if emptyRoomTTL <= 0 {
+		emptyRoomTTL = 5 * time.Minute
+	}
+
 	return &SFUStorage{
-		rooms: make(map[uuid.UUID]*models.Room),
+		rooms:             make(map[uuid.UUID]*models.Room),
+		roomCleanupTimers: make(map[uuid.UUID]*time.Timer),
+		emptyRoomTTL:      emptyRoomTTL,
 	}
 }
 
@@ -56,6 +65,7 @@ func (s *SFUStorage) AddPeer(roomID uuid.UUID, peer *models.Peer) error {
 	}
 
 	room.Peers[peer.ID] = peer
+	s.cancelRoomCleanupLocked(roomID)
 
 	return nil
 }
@@ -110,7 +120,7 @@ func (s *SFUStorage) RemovePeer(roomID, peerID uuid.UUID) (*models.Peer, []*mode
 	}
 
 	if len(room.Peers) == 0 {
-		delete(s.rooms, roomID)
+		s.scheduleRoomCleanupLocked(roomID)
 	}
 
 	return peer, removedTracks, nil
@@ -191,4 +201,44 @@ func (s *SFUStorage) Tracks(roomID uuid.UUID) ([]*models.PublishedTrack, error) 
 	}
 
 	return tracks, nil
+}
+
+func (s *SFUStorage) cancelRoomCleanupLocked(roomID uuid.UUID) {
+	timer, ok := s.roomCleanupTimers[roomID]
+	if !ok {
+		return
+	}
+
+	timer.Stop()
+	delete(s.roomCleanupTimers, roomID)
+}
+
+func (s *SFUStorage) scheduleRoomCleanupLocked(roomID uuid.UUID) {
+	s.cancelRoomCleanupLocked(roomID)
+
+	var timer *time.Timer
+	timer = time.AfterFunc(s.emptyRoomTTL, func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		currentTimer, ok := s.roomCleanupTimers[roomID]
+		if !ok || currentTimer != timer {
+			return
+		}
+
+		room, ok := s.rooms[roomID]
+		if !ok {
+			delete(s.roomCleanupTimers, roomID)
+			return
+		}
+		if len(room.Peers) != 0 {
+			delete(s.roomCleanupTimers, roomID)
+			return
+		}
+
+		delete(s.rooms, roomID)
+		delete(s.roomCleanupTimers, roomID)
+	})
+
+	s.roomCleanupTimers[roomID] = timer
 }

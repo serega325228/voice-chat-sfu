@@ -32,6 +32,7 @@ type GRPCServerKeepalive struct {
 
 type Signaling struct {
 	ReattachGracePeriod time.Duration `yaml:"reattach_grace_period" env-default:"30s"`
+	EmptyRoomTTL        time.Duration `yaml:"empty_room_ttl" env-default:"5m"`
 }
 
 type WebRTC struct {
