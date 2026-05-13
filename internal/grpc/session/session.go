@@ -7,6 +7,7 @@ import (
 	"io"
 	"time"
 	"voice-chat-sfu/internal/models"
+	"voice-chat-sfu/internal/storage"
 
 	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
@@ -26,6 +27,7 @@ type SessionService interface {
 	CreateSession(ctx context.Context, roomID, peerID uuid.UUID) error
 	JoinSession(ctx context.Context, roomID, peerID uuid.UUID) error
 	LeaveSession(ctx context.Context, roomID, peerID uuid.UUID) error
+	DisconnectPeer(ctx context.Context, peer *models.Peer) error
 	ProcessingDescription(ctx context.Context, peer *models.Peer, sdp string, sdpType webrtc.SDPType) error
 	GetCandidate(
 		ctx context.Context,
@@ -60,7 +62,7 @@ func (s *serverAPI) CreateSession(
 	}
 	if err := s.service.CreateSession(ctx, roomID, peerID); err != nil {
 		wrappedErr := fmt.Errorf("%s: %w", op, err)
-		return nil, status.Error(codes.Internal, wrappedErr.Error())
+		return nil, toStatusError(wrappedErr)
 	}
 
 	return &sessionv1.CreateSessionResponse{}, nil
@@ -78,7 +80,7 @@ func (s *serverAPI) JoinSession(
 	}
 	if err := s.service.JoinSession(ctx, roomID, peerID); err != nil {
 		wrappedErr := fmt.Errorf("%s: %w", op, err)
-		return nil, status.Error(codes.Internal, wrappedErr.Error())
+		return nil, toStatusError(wrappedErr)
 	}
 
 	return &sessionv1.JoinSessionResponse{}, nil
@@ -96,7 +98,7 @@ func (s *serverAPI) LeaveSession(
 	}
 	if err := s.service.LeaveSession(ctx, roomID, peerID); err != nil {
 		wrappedErr := fmt.Errorf("%s: %w", op, err)
-		return nil, status.Error(codes.Internal, wrappedErr.Error())
+		return nil, toStatusError(wrappedErr)
 	}
 
 	return &sessionv1.LeaveSessionResponse{}, nil
@@ -172,7 +174,7 @@ func (s *serverAPI) SignalPeer(
 
 	err = <-errCh
 	peer.Detach(attachmentGeneration, s.cfg.StreamReattachGracePeriod, func() {
-		_ = s.service.LeaveSession(context.Background(), peer.RoomID, peer.ID)
+		_ = s.service.DisconnectPeer(context.Background(), peer)
 	})
 	if err == io.EOF || errors.Is(err, context.Canceled) {
 		return nil
@@ -330,6 +332,19 @@ func parseIDs(roomIDRaw, peerIDRaw string) (uuid.UUID, uuid.UUID, error) {
 	}
 
 	return roomID, peerID, nil
+}
+
+func toStatusError(err error) error {
+	switch {
+	case errors.Is(err, storage.ErrRoomNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, storage.ErrPeerNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, storage.ErrPeerAlreadyExists):
+		return status.Error(codes.AlreadyExists, err.Error())
+	default:
+		return status.Error(codes.Internal, err.Error())
+	}
 }
 
 func toProtoSDPType(sdpType webrtc.SDPType) sessionv1.SdpType {

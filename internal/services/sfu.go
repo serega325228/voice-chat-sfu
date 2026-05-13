@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"voice-chat-sfu/internal/models"
+	"voice-chat-sfu/internal/storage"
 
 	"github.com/google/uuid"
 	"github.com/pion/interceptor"
@@ -18,8 +19,10 @@ const renegotiationNeededState = "negotiation_needed"
 type SFUStorage interface {
 	CreateRoom(roomID uuid.UUID, creatorPeer *models.Peer) error
 	AddPeer(roomID uuid.UUID, peer *models.Peer) error
+	ReconnectPeer(roomID uuid.UUID, peer *models.Peer) (*models.Peer, []*models.PublishedTrack, error)
 	GetPeer(roomID, peerID uuid.UUID) (*models.Peer, error)
 	RemovePeer(roomID, peerID uuid.UUID) (*models.Peer, []*models.PublishedTrack, error)
+	MarkPeerDisconnected(roomID uuid.UUID, peer *models.Peer) ([]*models.PublishedTrack, error)
 	PeersExcept(roomID, peerID uuid.UUID) ([]*models.Peer, error)
 	AddTrack(roomID uuid.UUID, track *models.PublishedTrack) error
 	RemoveTrack(roomID uuid.UUID, trackID string) error
@@ -126,13 +129,26 @@ func (s *SFUService) JoinSession(ctx context.Context, roomID, peerID uuid.UUID) 
 	}
 
 	if err := s.storage.AddPeer(roomID, peer); err != nil {
-		_ = peer.Conn.Close()
-		return fmt.Errorf("%s: %w", op, err)
+		if !errors.Is(err, storage.ErrPeerAlreadyExists) {
+			_ = peer.Conn.Close()
+			return fmt.Errorf("%s: %w", op, err)
+		}
+
+		oldPeer, removedTracks, reconnectErr := s.storage.ReconnectPeer(roomID, peer)
+		if reconnectErr != nil {
+			_ = peer.Conn.Close()
+			return fmt.Errorf("%s: %w", op, reconnectErr)
+		}
+		if err := s.removePublishedTracksFromPeers(roomID, removedTracks); err != nil {
+			_ = peer.Conn.Close()
+			return fmt.Errorf("%s: %w", op, err)
+		}
+		s.closePeerConnection(oldPeer)
 	}
 
 	publishedTracks, err := s.storage.Tracks(roomID)
 	if err != nil {
-		_ = s.closeAndRemovePeer(peer)
+		_ = s.closeAndDisconnectPeer(peer)
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
@@ -164,7 +180,19 @@ func (s *SFUService) LeaveSession(ctx context.Context, roomID, peerID uuid.UUID)
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
-	if err := s.closeAndRemovePeer(peer); err != nil {
+	if err := s.closeAndDisconnectPeer(peer); err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+
+	return nil
+}
+
+func (s *SFUService) DisconnectPeer(ctx context.Context, peer *models.Peer) error {
+	const op = "SFUService.DisconnectPeer"
+
+	_ = ctx
+
+	if err := s.closeAndDisconnectPeer(peer); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
@@ -282,8 +310,8 @@ func (s *SFUService) bindPeerConnectionHandlers(peer *models.Peer) error {
 		})
 
 		peer.Conn.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-			if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
-				if err := s.closeAndRemovePeer(peer); err != nil {
+			if state == webrtc.PeerConnectionStateDisconnected || state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
+				if err := s.closeAndDisconnectPeer(peer); err != nil {
 					s.log.Warn("cleanup peer after connection state change", "peer_id", peer.ID, "room_id", peer.RoomID, "state", state.String(), "err", err)
 				}
 			}
@@ -450,6 +478,7 @@ func (s *SFUService) newPeer(roomID, peerID uuid.UUID) (*models.Peer, error) {
 		LifetimeCtx:  lifetimeCtx,
 		Cancel:       cancel,
 		TrackSenders: make(map[string]*webrtc.RTPSender),
+		Status:       models.PeerConnected,
 	}, nil
 }
 
@@ -464,25 +493,35 @@ func (s *SFUService) emitPeerEvent(peer *models.Peer, evt *models.PeerEvent) err
 	}
 }
 
-func (s *SFUService) closeAndRemovePeer(peer *models.Peer) error {
-	const op = "SFUService.closeAndRemovePeer"
+func (s *SFUService) closeAndDisconnectPeer(peer *models.Peer) error {
+	const op = "SFUService.closeAndDisconnectPeer"
 
 	peer.Cancel()
 
-	_, removedTracks, err := s.storage.RemovePeer(peer.RoomID, peer.ID)
+	removedTracks, err := s.storage.MarkPeerDisconnected(peer.RoomID, peer)
 	if err != nil {
-		s.log.Debug("peer already removed from storage", "room_id", peer.RoomID, "peer_id", peer.ID, "err", err)
+		if errors.Is(err, storage.ErrPeerNotFound) {
+			s.log.Debug("peer already replaced or removed from storage", "room_id", peer.RoomID, "peer_id", peer.ID, "err", err)
+			s.closePeerConnection(peer)
+			return nil
+		}
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	if err := s.removePublishedTracksFromPeers(peer.RoomID, removedTracks); err != nil {
 		return fmt.Errorf("%s: %w", op, err)
 	}
 
+	s.closePeerConnection(peer)
+
+	return nil
+}
+
+func (s *SFUService) closePeerConnection(peer *models.Peer) {
+	peer.Cancel()
 	if err := peer.Conn.Close(); err != nil {
 		s.log.Debug("peer connection already closed", "room_id", peer.RoomID, "peer_id", peer.ID, "err", err)
 	}
-
-	return nil
 }
 
 func (s *SFUService) requestRenegotiation(peer *models.Peer) error {

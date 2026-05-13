@@ -9,12 +9,21 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
+type PeerStatus string
+
+const (
+	PeerConnected    PeerStatus = "connected"
+	PeerReconnecting PeerStatus = "reconnecting"
+	PeerDisconnected PeerStatus = "disconnected"
+)
+
 type Peer struct {
 	ID           uuid.UUID
 	RoomID       uuid.UUID
 	Conn         *webrtc.PeerConnection
 	Events       chan *PeerEvent
 	HandlersOnce sync.Once
+	Status       PeerStatus
 
 	LifetimeCtx          context.Context
 	Cancel               context.CancelFunc
@@ -26,6 +35,37 @@ type Peer struct {
 	attachmentGeneration uint64
 	attached             bool
 	detachTimer          *time.Timer
+}
+
+func (p *Peer) MarkConnected() {
+	p.attachmentMu.Lock()
+	defer p.attachmentMu.Unlock()
+
+	p.Status = PeerConnected
+}
+
+func (p *Peer) MarkReconnecting() {
+	p.attachmentMu.Lock()
+	defer p.attachmentMu.Unlock()
+
+	if p.Status != PeerDisconnected {
+		p.Status = PeerReconnecting
+	}
+}
+
+func (p *Peer) MarkDisconnected() {
+	p.attachmentMu.Lock()
+	defer p.attachmentMu.Unlock()
+
+	p.attached = false
+	p.Status = PeerDisconnected
+}
+
+func (p *Peer) IsConnected() bool {
+	p.attachmentMu.Lock()
+	defer p.attachmentMu.Unlock()
+
+	return p.Status == PeerConnected
 }
 
 func (p *Peer) HasTrackSender(trackID string) bool {
@@ -83,6 +123,7 @@ func (p *Peer) Attach() uint64 {
 
 	p.attachmentGeneration++
 	p.attached = true
+	p.Status = PeerConnected
 
 	return p.attachmentGeneration
 }
@@ -103,6 +144,7 @@ func (p *Peer) Detach(generation uint64, gracePeriod time.Duration, onExpire fun
 	}
 
 	p.attached = false
+	p.Status = PeerReconnecting
 
 	if p.detachTimer != nil {
 		p.detachTimer.Stop()
