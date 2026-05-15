@@ -35,6 +35,7 @@ type Peer struct {
 	attachmentGeneration uint64
 	attached             bool
 	detachTimer          *time.Timer
+	attachmentCancel     context.CancelFunc
 }
 
 func (p *Peer) MarkConnected() {
@@ -112,7 +113,7 @@ func (p *Peer) ClearRenegotiationNeeded() {
 	p.renegotiationPending = false
 }
 
-func (p *Peer) Attach() uint64 {
+func (p *Peer) Attach() (uint64, context.Context) {
 	p.attachmentMu.Lock()
 	defer p.attachmentMu.Unlock()
 
@@ -120,12 +121,17 @@ func (p *Peer) Attach() uint64 {
 		p.detachTimer.Stop()
 		p.detachTimer = nil
 	}
+	if p.attachmentCancel != nil {
+		p.attachmentCancel()
+	}
 
+	attachmentCtx, cancel := context.WithCancel(context.Background())
 	p.attachmentGeneration++
 	p.attached = true
 	p.Status = PeerConnected
+	p.attachmentCancel = cancel
 
-	return p.attachmentGeneration
+	return p.attachmentGeneration, attachmentCtx
 }
 
 func (p *Peer) IsCurrentAttachment(generation uint64) bool {
@@ -145,6 +151,10 @@ func (p *Peer) Detach(generation uint64, gracePeriod time.Duration, onExpire fun
 
 	p.attached = false
 	p.Status = PeerReconnecting
+	if p.attachmentCancel != nil {
+		p.attachmentCancel()
+		p.attachmentCancel = nil
+	}
 
 	if p.detachTimer != nil {
 		p.detachTimer.Stop()

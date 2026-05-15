@@ -126,7 +126,7 @@ func (s *serverAPI) SignalPeer(
 		wrappedErr := fmt.Errorf("%s: %w", op, err)
 		return status.Error(codes.NotFound, wrappedErr.Error())
 	}
-	attachmentGeneration := peer.Attach()
+	attachmentGeneration, attachmentCtx := peer.Attach()
 
 	errCh := make(chan error, 2)
 
@@ -155,6 +155,9 @@ func (s *serverAPI) SignalPeer(
 			select {
 			case <-ctx.Done():
 				errCh <- ctx.Err()
+				return
+			case <-attachmentCtx.Done():
+				errCh <- attachmentCtx.Err()
 				return
 			case <-peer.LifetimeCtx.Done():
 				errCh <- peer.LifetimeCtx.Err()
